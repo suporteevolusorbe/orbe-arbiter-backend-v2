@@ -314,19 +314,33 @@ async function executeSwapLogic(data, res) {
       } catch (err) {
         console.error(`   ❌ Failed to transfer to ${label}:`, err.message);
         
-        // 🔥 CRITICAL FIX FOR RESTART LOOPS: 
-        // If we get "exceeds balance" despite our check, it means RPC is lagging OR we already sent it (Nonce race).
-        // In this case, we MUST SKIP to prevent infinite loops.
-        if (err.message.includes("exceeds balance") || err.message.includes("insufficient funds")) {
+        // 🛡️ ROBUST ERROR CHECKING (Ethers v6)
+        // Ethers v6 wraps reverts in CALL_EXCEPTION with details in 'reason' or 'shortMessage'
+        const msg = (err.message || "").toLowerCase();
+        const reason = (err.reason || "").toLowerCase();
+        const shortMsg = (err.shortMessage || "").toLowerCase();
+        const code = (err.code || "");
+        
+        // Check for "exceeds balance" or "insufficient funds" in any error property
+        const isLowBalance = 
+            msg.includes("exceeds balance") || 
+            msg.includes("insufficient funds") ||
+            reason.includes("exceeds balance") ||
+            reason.includes("insufficient funds") ||
+            shortMsg.includes("exceeds balance") ||
+            shortMsg.includes("insufficient funds") ||
+            code === 'INSUFFICIENT_FUNDS' ||
+            (code === 'CALL_EXCEPTION' && (reason.includes('exceeds balance') || shortMsg.includes('exceeds balance')));
+
+        if (isLowBalance) {
              console.warn(`⚠️ DETECTED DOUBLE SPEND/LOW BALANCE ERROR. SKIPPING ${label} TO UNBLOCK QUEUE.`);
              // Try to reset nonce just in case
-             currentNonce = await provider.getTransactionCount(wallet.address, "latest");
+             try { currentNonce = await provider.getTransactionCount(wallet.address, "latest"); } catch(e) {}
              return "0x_skipped_low_balance_error";
         }
         
-        currentNonce = await provider.getTransactionCount(wallet.address, "latest");
-        // Return error string to allow calling code to decide (currently we just save it)
-        return `0x_error_${err.code || 'failed'}`; 
+        try { currentNonce = await provider.getTransactionCount(wallet.address, "latest"); } catch(e) {}
+        return `0x_error_${code || 'failed'}`; 
       }
     };
 
