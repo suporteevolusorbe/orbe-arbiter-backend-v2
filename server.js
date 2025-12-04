@@ -259,13 +259,16 @@ async function executeSwapLogic(data, res) {
       
       if (available < required) {
           console.warn(`⚠️ INSUFFICIENT BALANCE for ${label}. Need ${required}, Have ${available}`);
-          if (available <= 0) {
-              console.error(`🛑 Skipping ${label} transfer due to 0 balance.`);
+          
+          // If balance is effectively zero, skip
+          if (available <= 0.000001) {
+              console.error(`🛑 Skipping ${label} transfer due to ~0 balance.`);
               return "0x_skipped_low_balance";
           }
+          
           // SWEEP: Send everything available
           console.warn(`⚠️ Adjusting ${label} transfer to max available: ${available}`);
-          finalAmount = available; 
+          finalAmount = available * 0.99; // 1% buffer to be safe
       }
 
       // Check if Native/Wrapped
@@ -282,7 +285,7 @@ async function executeSwapLogic(data, res) {
         if (isNative) {
            const formattedAmount = formatAmount(finalAmount, 18);
            // Subtract gas buffer if sending native
-           const gasBuffer = 0.0005;
+           const gasBuffer = 0.001;
            const safeAmount = Math.max(0, parseFloat(formattedAmount) - gasBuffer);
            const amountWei = ethers.parseUnits(safeAmount.toString(), 18);
            
@@ -437,7 +440,7 @@ async function executeRefundLogic(data, res) {
 // ============================================
 
 app.get('/', (req, res) => {
-  res.send('🚀 ORBE Arbiter Backend is Running Securely v3.5 (Safe Balance + Stateful Retry)');
+  res.send('🚀 ORBE Arbiter Backend is Running Securely v3.6 (Enhanced Low Balance Protection)');
 });
 
 app.post('/api/arbiter/execute-swap', authenticate, (req, res) => {
