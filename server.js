@@ -121,13 +121,16 @@ const authenticate = (req, res, next) => {
 };
 
 // ============================================
-// 🔄 QUEUE SYSTEM (NONCE MANAGEMENT & IDEMPOTENCY)
+// 🔄 QUEUE SYSTEM (NONCE MANAGEMENT & STATEFUL RETRY)
 // ============================================
 
 const swapQueue = [];
 let isProcessing = false;
 let currentNonce = null;
-const processedSwaps = new Set(); // Idempotency
+
+// 🧠 STATEFUL TRACKING: Prevents double spending on retries
+// Map<inviteCode, { buyerTx, sellerTx, feesTx, timestamp }>
+const swapState = new Map();
 
 async function processQueue() {
   if (isProcessing || swapQueue.length === 0) return;
@@ -158,7 +161,7 @@ async function processQueue() {
 }
 
 // ============================================
-// 💰 LOGIC: EXECUTE SWAP
+// 💰 LOGIC: EXECUTE SWAP (STATEFUL & ATOMIC-LIKE)
 // ============================================
 
 async function executeSwapLogic(data, res) {
@@ -170,10 +173,33 @@ async function executeSwapLogic(data, res) {
     inviteCode 
   } = data;
 
-  // 🛡️ Idempotency Check
-  if (processedSwaps.has(inviteCode)) {
-    console.warn(`⚠️ Swap ${inviteCode} already processed recently. Skipping.`);
-    return res.json({ success: false, error: "Swap already processed (idempotency)" });
+  // 🧠 Load or Initialize State
+  let state = swapState.get(inviteCode);
+  
+  // If already fully completed, return immediately
+  if (state && state.completed) {
+    console.log(`✅ Swap ${inviteCode} already fully completed. Returning cached result.`);
+    return res.json({
+      success: true,
+      message: "Swap already completed",
+      transactions: {
+        transfer1: state.buyerTx,
+        transfer2: state.sellerTx,
+        transfer3: state.feesTx
+      },
+      timestamp: new Date(state.timestamp).toISOString()
+    });
+  }
+
+  // Initialize new state if not exists
+  if (!state) {
+    state = { buyerTx: null, sellerTx: null, feesTx: null, completed: false, timestamp: Date.now() };
+    swapState.set(inviteCode, state);
+    
+    // Cleanup after 20 minutes
+    setTimeout(() => {
+        if (swapState.has(inviteCode)) swapState.delete(inviteCode);
+    }, 20 * 60 * 1000);
   }
 
   try {
@@ -184,7 +210,7 @@ async function executeSwapLogic(data, res) {
     const provider = new ethers.JsonRpcProvider(rpcUrl);
     const wallet = new ethers.Wallet(PRIVATE_KEY, provider);
     
-    // 2. Nonce Management
+    // 2. Nonce Management (Sync if needed)
     if (currentNonce === null) {
       currentNonce = await provider.getTransactionCount(wallet.address, "latest");
     }
@@ -192,22 +218,11 @@ async function executeSwapLogic(data, res) {
     console.log(`🔐 Wallet: ${wallet.address}`);
     console.log(`🔢 Nonce: ${currentNonce}`);
 
-    const results = {
-      transfer1: null, // Seller Token -> Buyer
-      transfer2: null, // Buyer Token -> Seller
-      transfer3: null  // Fees -> Treasury
-    };
-
     // 🔥 HELPER: Format amount strictly to decimals to prevent "too many decimals" error
-    // Also handles rounding down to avoid "exceeds balance" errors
     const formatAmount = (amount, decimals) => {
         if (!amount) return "0";
-        
-        // 1. Ensure it's a number string, expand scientific notation
-        // toFixed(decimals + 18) gives us enough precision to slice later
+        // Ensure enough precision then truncate
         let str = Number(amount).toFixed(decimals + 18); 
-        
-        // 2. Truncate (floor) to exactly 'decimals' places
         const dotIndex = str.indexOf('.');
         if (dotIndex !== -1) {
             str = str.slice(0, dotIndex + 1 + decimals);
@@ -217,12 +232,10 @@ async function executeSwapLogic(data, res) {
 
     // Helper for transfers with Native Fix
     const transferToken = async (tokenAddress, to, amount, label) => {
-      if (!amount || parseFloat(amount) <= 0) return null;
+      if (!amount || parseFloat(amount) <= 0) return "0x_skipped_zero_amount";
       
-      // Check if Wrapped Native
+      // Check if Wrapped Native or Native Symbol
       const isWrappedNative = WRAPPED_NATIVE_TOKENS[tokenAddress.toLowerCase()];
-      
-      // Check if Native Symbol or Address
       const isNative = isWrappedNative || 
                       tokenAddress === 'BNB' || 
                       tokenAddress === 'ETH' || 
@@ -234,7 +247,6 @@ async function executeSwapLogic(data, res) {
       try {
         if (isNative) {
            // 🟢 SEND NATIVE (BNB/ETH)
-           // Native always 18 decimals
            const formattedAmount = formatAmount(amount, 18);
            const amountWei = ethers.parseUnits(formattedAmount, 18);
            
@@ -244,18 +256,16 @@ async function executeSwapLogic(data, res) {
              nonce: currentNonce++
            });
            console.log(`   ✅ ${label} TX sent: ${tx.hash}`);
-           await tx.wait(1); // Wait for 1 confirmation
+           await tx.wait(1);
            return tx.hash;
         } else {
           // 🔵 SEND ERC20
           const abi = ["function transfer(address to, uint256 amount) returns (bool)", "function decimals() view returns (uint8)"];
           const contract = new ethers.Contract(tokenAddress, abi, wallet);
           
-          // Get decimals dynamically if possible, default 18
           let decimals = 18;
           try { decimals = await contract.decimals(); } catch(e) {}
           
-          // Format strictly to token decimals
           const formattedAmount = formatAmount(amount, decimals);
           const amountWei = ethers.parseUnits(formattedAmount, decimals);
           
@@ -266,7 +276,7 @@ async function executeSwapLogic(data, res) {
         }
       } catch (err) {
         console.error(`   ❌ Failed to transfer to ${label}:`, err.message);
-        // Reset nonce on error to be safe
+        // Reset nonce on error to resync
         currentNonce = await provider.getTransactionCount(wallet.address, "latest");
         throw err; 
       }
@@ -276,73 +286,71 @@ async function executeSwapLogic(data, res) {
     // 💰 FEE CALCULATION LOGIC
     // ============================================
     
-    // 1. Determine Total Fee % (Default 10.0% if not provided)
     const finalFeePercent = parseFloat(feePercent) || 10.0;
-    
-    // 2. Split Fee per Party (50% each side)
-    // e.g. Total 10% -> 5% Buyer, 5% Seller
     const feePerPartyPercent = finalFeePercent / 2;
     const feeMultiplier = feePerPartyPercent / 100; // 0.05
 
-    console.log(`💰 FEE CONFIGURATION:`);
-    console.log(`   Requested Fee: ${feePercent || 'Not provided (Using Default)'}%`);
-    console.log(`   Applied Total Fee: ${finalFeePercent}%`);
-    console.log(`   Split Per Party: ${feePerPartyPercent}%`);
-    console.log(`   Multiplier: ${feeMultiplier}`);
-
-    // 3. Calculate Amounts
-    // Buyer receives Seller's token minus fee
+    // Calculate Amounts
     const buyerFeeAmt = parseFloat(sellerAmount) * feeMultiplier;
     const buyerNet = parseFloat(sellerAmount) - buyerFeeAmt;
     
-    // Seller receives Buyer's token minus fee
     const sellerFeeAmt = parseFloat(buyerAmount) * feeMultiplier;
     const sellerNet = parseFloat(buyerAmount) - sellerFeeAmt;
 
-    console.log(`💰 AMOUNTS:`);
-    console.log(`   Seller Amount (Gross): ${sellerAmount} -> Buyer Net: ${buyerNet} (Fee: ${buyerFeeAmt})`);
-    console.log(`   Buyer Amount (Gross): ${buyerAmount} -> Seller Net: ${sellerNet} (Fee: ${sellerFeeAmt})`);
+    // ============================================
+    // 🔄 STATEFUL EXECUTION
+    // ============================================
 
-    // EXECUTE TRANSFERS
-    
-    // 1. Transfer to Buyer
-    results.transfer1 = await transferToken(sellerToken, buyerAddress, buyerNet, "Buyer");
-    
-    // 2. Transfer to Seller
-    results.transfer2 = await transferToken(buyerToken, sellerAddress, sellerNet, "Seller");
-    
-    // 3. Fees Distribution (30% stays in Arbiter for Gas, 70% to Treasury)
-    // We only send the 70% share to Treasury. The rest stays in this wallet.
-    const treasuryShare = 0.70;
-    
-    if (buyerFeeAmt > 0) {
-       const amountToTreasury = buyerFeeAmt * treasuryShare;
-       console.log(`   🏦 Distributing Fee 1: Total ${buyerFeeAmt} -> Treasury: ${amountToTreasury} (70%)`);
-       await transferToken(sellerToken, TREASURY_ADDRESS, amountToTreasury, "Treasury (70% of Fee 1)");
-    }
-    if (sellerFeeAmt > 0) {
-       const amountToTreasury = sellerFeeAmt * treasuryShare;
-       console.log(`   🏦 Distributing Fee 2: Total ${sellerFeeAmt} -> Treasury: ${amountToTreasury} (70%)`);
-       await transferToken(buyerToken, TREASURY_ADDRESS, amountToTreasury, "Treasury (70% of Fee 2)");
+    // 1. Transfer to Buyer (if not done)
+    if (!state.buyerTx) {
+        state.buyerTx = await transferToken(sellerToken, buyerAddress, buyerNet, "Buyer");
+        swapState.set(inviteCode, state); // Save progress
+    } else {
+        console.log(`⏭️ Skipping Buyer transfer (already done: ${state.buyerTx})`);
     }
     
-    results.transfer3 = "fees_distributed_70_30"; // Placeholder
+    // 2. Transfer to Seller (if not done)
+    if (!state.sellerTx) {
+        state.sellerTx = await transferToken(buyerToken, sellerAddress, sellerNet, "Seller");
+        swapState.set(inviteCode, state); // Save progress
+    } else {
+        console.log(`⏭️ Skipping Seller transfer (already done: ${state.sellerTx})`);
+    }
+    
+    // 3. Fees Distribution (if not done)
+    if (!state.feesTx) {
+        const treasuryShare = 0.70;
+        let feeTxHash = "0x_fees_accumulated"; // Placeholder if batched, or real if sent
+        
+        // Send fees directly to treasury to avoid accumulation in arbiter
+        if (buyerFeeAmt > 0) {
+           const amountToTreasury = buyerFeeAmt * treasuryShare;
+           const tx = await transferToken(sellerToken, TREASURY_ADDRESS, amountToTreasury, "Treasury (Fee 1)");
+           if (tx && tx.startsWith('0x')) feeTxHash = tx;
+        }
+        if (sellerFeeAmt > 0) {
+           const amountToTreasury = sellerFeeAmt * treasuryShare;
+           const tx = await transferToken(buyerToken, TREASURY_ADDRESS, amountToTreasury, "Treasury (Fee 2)");
+           if (tx && tx.startsWith('0x')) feeTxHash = tx;
+        }
+        
+        state.feesTx = feeTxHash;
+        swapState.set(inviteCode, state);
+    }
 
-    // ✅ Success - Mark as processed
-    processedSwaps.add(inviteCode);
-    // Clear from cache after 10 minutes
-    setTimeout(() => processedSwaps.delete(inviteCode), 600000);
+    // ✅ Mark Complete
+    state.completed = true;
+    swapState.set(inviteCode, state);
 
     res.json({
       success: true,
       message: "Swap executed successfully",
-      transactions: results,
-      timestamp: new Date().toISOString(),
-      feeDetails: {
-        totalPercent: finalFeePercent,
-        perPartyPercent: feePerPartyPercent,
-        treasuryShare: 0.70
-      }
+      transactions: {
+        transfer1: state.buyerTx,
+        transfer2: state.sellerTx,
+        transfer3: state.feesTx
+      },
+      timestamp: new Date().toISOString()
     });
 
   } catch (error) {
@@ -356,7 +364,6 @@ async function executeSwapLogic(data, res) {
 // ============================================
 
 async function executeRefundLogic(data, res) {
-    // Implementation for refund - similar to swap but returns to origin
     res.json({ success: true, message: "Refund processed (placeholder)" });
 }
 
@@ -365,13 +372,11 @@ async function executeRefundLogic(data, res) {
 // ============================================
 
 app.get('/', (req, res) => {
-  res.send('🚀 ORBE Arbiter Backend is Running Securely v3.2 (Native Fix + Fees 70/30 + Decimal Overflow Fix)');
+  res.send('🚀 ORBE Arbiter Backend is Running Securely v3.4 (Stateful Retry + Decimal Fix)');
 });
 
 app.post('/api/arbiter/execute-swap', authenticate, (req, res) => {
-  // Add to queue
   swapQueue.push({ type: 'swap', data: req.body, res });
-  // Trigger processing
   processQueue();
 });
 
