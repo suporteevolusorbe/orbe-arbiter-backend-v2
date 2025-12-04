@@ -1,0 +1,86 @@
+/**
+ * App Configuration
+ * Centraliza URLs e configurações da aplicação
+ */
+
+/**
+ * Retorna a URL base da aplicação
+ * Em produção: usa o domínio customizado
+ * Em preview: detecta automaticamente
+ */
+export function getAppUrl() {
+  if (typeof window === 'undefined') return '';
+  
+  // Produção: domínio customizado
+  const hostname = window.location.hostname;
+  if (hostname === 'orbeescrow.com' || hostname === 'www.orbeescrow.com') {
+    return 'https://orbeescrow.com';
+  }
+  
+  // Preview/Dev: usar origem atual
+  return window.location.origin;
+}
+
+/**
+ * Gera URL completa para uma página
+ */
+export function getFullPageUrl(pageName, params = {}) {
+  const baseUrl = getAppUrl();
+  const path = `/${pageName.toLowerCase()}`;
+  
+  // Adicionar parâmetros se existirem
+  const queryString = Object.keys(params).length > 0
+    ? '?' + new URLSearchParams(params).toString()
+    : '';
+  
+  return `${baseUrl}${path}${queryString}`;
+}
+
+/**
+ * Gera link de convite para aceitar oferta
+ */
+export function getInviteLink(inviteCode) {
+  return getFullPageUrl('AcceptInvite', { code: inviteCode });
+}
+
+/**
+ * Configurações de email
+ */
+export const EMAIL_CONFIG = {
+  SUPPORT_EMAIL: 'suporte@evolusorbe.com',
+  FROM_NAME: 'ORBE ESCROW',
+  NOREPLY_EMAIL: 'noreply@evolusorbe.com'
+};
+
+/**
+ * Endereços de contratos
+ */
+export const CONTRACT_ADDRESSES = {
+  ARBITER: '0x029b35c72fb48844f39525d8cb248fbe5167d02b',
+  TREASURY: '0xa433c78ebe278e4b84fec15fb235e86db889d52b'
+};
+
+/**
+ * Configurações de taxa
+ */
+export const FEE_CONFIG = {
+  TOTAL_FEE: 10.0,
+  FEE_PER_PART: 5.0
+};
+
+// ⚠️ UPDATE THIS URL AFTER DEPLOYING TO RENDER
+// Example: "https://orbe-arbiter-backend.onrender.com"
+export const ARBITER_CONFIG = {
+  URL: "https://centrosymmetric-zincy-lorita.ngrok-free.dev",
+  API_KEY: "RealSeed5207418" // ⚠️ Ensure this matches API_SECRET_KEY in Render Environment
+};
+
+export default {
+  getAppUrl,
+  getFullPageUrl,
+  getInviteLink,
+  EMAIL_CONFIG,
+  CONTRACT_ADDRESSES,
+  FEE_CONFIG,
+  ARBITER_CONFIG
+};
