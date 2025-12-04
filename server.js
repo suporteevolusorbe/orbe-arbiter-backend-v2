@@ -198,6 +198,23 @@ async function executeSwapLogic(data, res) {
       transfer3: null  // Fees -> Treasury
     };
 
+    // 🔥 HELPER: Format amount strictly to decimals to prevent "too many decimals" error
+    // Also handles rounding down to avoid "exceeds balance" errors
+    const formatAmount = (amount, decimals) => {
+        if (!amount) return "0";
+        
+        // 1. Ensure it's a number string, expand scientific notation
+        // toFixed(decimals + 18) gives us enough precision to slice later
+        let str = Number(amount).toFixed(decimals + 18); 
+        
+        // 2. Truncate (floor) to exactly 'decimals' places
+        const dotIndex = str.indexOf('.');
+        if (dotIndex !== -1) {
+            str = str.slice(0, dotIndex + 1 + decimals);
+        }
+        return str;
+    };
+
     // Helper for transfers with Native Fix
     const transferToken = async (tokenAddress, to, amount, label) => {
       if (!amount || parseFloat(amount) <= 0) return null;
@@ -214,15 +231,16 @@ async function executeSwapLogic(data, res) {
 
       console.log(`📤 Sending ${amount} ${isNative ? 'NATIVE (unwrap)' : tokenAddress} to ${label}...`);
       
-      // Safe parsing
-      const amountStr = amount.toString();
-      
       try {
         if (isNative) {
            // 🟢 SEND NATIVE (BNB/ETH)
+           // Native always 18 decimals
+           const formattedAmount = formatAmount(amount, 18);
+           const amountWei = ethers.parseUnits(formattedAmount, 18);
+           
            const tx = await wallet.sendTransaction({
              to: to,
-             value: ethers.parseEther(amountStr),
+             value: amountWei,
              nonce: currentNonce++
            });
            console.log(`   ✅ ${label} TX sent: ${tx.hash}`);
@@ -237,7 +255,9 @@ async function executeSwapLogic(data, res) {
           let decimals = 18;
           try { decimals = await contract.decimals(); } catch(e) {}
           
-          const amountWei = ethers.parseUnits(amountStr, decimals);
+          // Format strictly to token decimals
+          const formattedAmount = formatAmount(amount, decimals);
+          const amountWei = ethers.parseUnits(formattedAmount, decimals);
           
           const tx = await contract.transfer(to, amountWei, { nonce: currentNonce++ });
           console.log(`   ✅ ${label} TX sent: ${tx.hash}`);
@@ -252,17 +272,36 @@ async function executeSwapLogic(data, res) {
       }
     };
 
-    // Calculate Fees (Total Fee / 2 per party)
-    // feePercent is Total (e.g. 10%), so 5% per party
-    const halfFeePercent = (parseFloat(feePercent) || 10.0) / 200; // 5.0 / 100 = 0.05
+    // ============================================
+    // 💰 FEE CALCULATION LOGIC
+    // ============================================
     
+    // 1. Determine Total Fee % (Default 10.0% if not provided)
+    const finalFeePercent = parseFloat(feePercent) || 10.0;
+    
+    // 2. Split Fee per Party (50% each side)
+    // e.g. Total 10% -> 5% Buyer, 5% Seller
+    const feePerPartyPercent = finalFeePercent / 2;
+    const feeMultiplier = feePerPartyPercent / 100; // 0.05
+
+    console.log(`💰 FEE CONFIGURATION:`);
+    console.log(`   Requested Fee: ${feePercent || 'Not provided (Using Default)'}%`);
+    console.log(`   Applied Total Fee: ${finalFeePercent}%`);
+    console.log(`   Split Per Party: ${feePerPartyPercent}%`);
+    console.log(`   Multiplier: ${feeMultiplier}`);
+
+    // 3. Calculate Amounts
     // Buyer receives Seller's token minus fee
-    const buyerFeeAmt = parseFloat(sellerAmount) * halfFeePercent;
+    const buyerFeeAmt = parseFloat(sellerAmount) * feeMultiplier;
     const buyerNet = parseFloat(sellerAmount) - buyerFeeAmt;
     
     // Seller receives Buyer's token minus fee
-    const sellerFeeAmt = parseFloat(buyerAmount) * halfFeePercent;
+    const sellerFeeAmt = parseFloat(buyerAmount) * feeMultiplier;
     const sellerNet = parseFloat(buyerAmount) - sellerFeeAmt;
+
+    console.log(`💰 AMOUNTS:`);
+    console.log(`   Seller Amount (Gross): ${sellerAmount} -> Buyer Net: ${buyerNet} (Fee: ${buyerFeeAmt})`);
+    console.log(`   Buyer Amount (Gross): ${buyerAmount} -> Seller Net: ${sellerNet} (Fee: ${sellerFeeAmt})`);
 
     // EXECUTE TRANSFERS
     
@@ -278,10 +317,12 @@ async function executeSwapLogic(data, res) {
     
     if (buyerFeeAmt > 0) {
        const amountToTreasury = buyerFeeAmt * treasuryShare;
+       console.log(`   🏦 Distributing Fee 1: Total ${buyerFeeAmt} -> Treasury: ${amountToTreasury} (70%)`);
        await transferToken(sellerToken, TREASURY_ADDRESS, amountToTreasury, "Treasury (70% of Fee 1)");
     }
     if (sellerFeeAmt > 0) {
        const amountToTreasury = sellerFeeAmt * treasuryShare;
+       console.log(`   🏦 Distributing Fee 2: Total ${sellerFeeAmt} -> Treasury: ${amountToTreasury} (70%)`);
        await transferToken(buyerToken, TREASURY_ADDRESS, amountToTreasury, "Treasury (70% of Fee 2)");
     }
     
@@ -296,7 +337,12 @@ async function executeSwapLogic(data, res) {
       success: true,
       message: "Swap executed successfully",
       transactions: results,
-      timestamp: new Date().toISOString()
+      timestamp: new Date().toISOString(),
+      feeDetails: {
+        totalPercent: finalFeePercent,
+        perPartyPercent: feePerPartyPercent,
+        treasuryShare: 0.70
+      }
     });
 
   } catch (error) {
@@ -319,7 +365,7 @@ async function executeRefundLogic(data, res) {
 // ============================================
 
 app.get('/', (req, res) => {
-  res.send('🚀 ORBE Arbiter Backend is Running Securely v3.0 (Native Fix + Fees 70/30)');
+  res.send('🚀 ORBE Arbiter Backend is Running Securely v3.2 (Native Fix + Fees 70/30 + Decimal Overflow Fix)');
 });
 
 app.post('/api/arbiter/execute-swap', authenticate, (req, res) => {
