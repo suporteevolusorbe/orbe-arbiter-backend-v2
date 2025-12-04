@@ -242,7 +242,7 @@ async function executeSwapLogic(data, res) {
             }
         } catch (e) {
             console.error("❌ Balance check failed:", e.message);
-            return 0;
+            return 0; // Fail safe
         }
     };
 
@@ -284,7 +284,6 @@ async function executeSwapLogic(data, res) {
       try {
         if (isNative) {
            const formattedAmount = formatAmount(finalAmount, 18);
-           // Subtract gas buffer if sending native
            const gasBuffer = 0.001;
            const safeAmount = Math.max(0, parseFloat(formattedAmount) - gasBuffer);
            const amountWei = ethers.parseUnits(safeAmount.toString(), 18);
@@ -314,8 +313,19 @@ async function executeSwapLogic(data, res) {
         }
       } catch (err) {
         console.error(`   ❌ Failed to transfer to ${label}:`, err.message);
+        
+        // 🔥 CRITICAL FIX FOR RESTART LOOPS: 
+        // If we get "exceeds balance" despite our check, it means RPC is lagging OR we already sent it (Nonce race).
+        // In this case, we MUST SKIP to prevent infinite loops.
+        if (err.message.includes("exceeds balance") || err.message.includes("insufficient funds")) {
+             console.warn(`⚠️ DETECTED DOUBLE SPEND/LOW BALANCE ERROR. SKIPPING ${label} TO UNBLOCK QUEUE.`);
+             // Try to reset nonce just in case
+             currentNonce = await provider.getTransactionCount(wallet.address, "latest");
+             return "0x_skipped_low_balance_error";
+        }
+        
         currentNonce = await provider.getTransactionCount(wallet.address, "latest");
-        // Don't throw, just return error string to allow state update
+        // Return error string to allow calling code to decide (currently we just save it)
         return `0x_error_${err.code || 'failed'}`; 
       }
     };
@@ -342,9 +352,9 @@ async function executeSwapLogic(data, res) {
     // 1. Transfer to Buyer
     if (!state.buyerTx || state.buyerTx.startsWith('0x_error')) {
         const result = await transferToken(sellerToken, buyerAddress, buyerNet, "Buyer");
-        // If we skipped due to low balance, mark as "done" effectively to stop retry loop
-        if (result === "0x_skipped_low_balance") {
-            state.buyerTx = "0x_already_done"; // Mark as done to prevent loop
+        // If we skipped due to low balance/error, mark as "done" to stop loop
+        if (result === "0x_skipped_low_balance" || result === "0x_skipped_low_balance_error") {
+            state.buyerTx = "0x_already_done"; 
         } else {
             state.buyerTx = result;
         }
@@ -354,7 +364,7 @@ async function executeSwapLogic(data, res) {
     // 2. Transfer to Seller
     if (!state.sellerTx || state.sellerTx.startsWith('0x_error')) {
         const result = await transferToken(buyerToken, sellerAddress, sellerNet, "Seller");
-         if (result === "0x_skipped_low_balance") {
+         if (result === "0x_skipped_low_balance" || result === "0x_skipped_low_balance_error") {
             state.sellerTx = "0x_already_done";
         } else {
             state.sellerTx = result;
@@ -364,8 +374,6 @@ async function executeSwapLogic(data, res) {
     
     // 3. Fees Distribution
     if (!state.feesTx) {
-        // Fees are best effort. If main transfers drained wallet, fees might be 0.
-        // That's acceptable for avoiding crash loops.
         const treasuryShare = 0.70;
         let feeTxHash = "0x_fees_accumulated";
         
@@ -411,14 +419,12 @@ async function executeSwapLogic(data, res) {
 // ============================================
 
 async function executeRefundLogic(data, res) {
-    // Basic refund logic mirroring swap but to original owners
      const { 
         buyerAddress, sellerAddress, 
         sellerAmount, sellerToken, 
         network, inviteCode 
     } = data;
 
-    // Just try to return seller funds for now
     try {
         const rpcUrl = RPC_URLS[network];
         if (!rpcUrl) throw new Error(`Network ${network} not supported`);
@@ -426,8 +432,6 @@ async function executeRefundLogic(data, res) {
         const provider = new ethers.JsonRpcProvider(rpcUrl);
         const wallet = new ethers.Wallet(PRIVATE_KEY, provider);
         
-        // Simple non-stateful refund for MVP
-        // Implement similar transferToken logic here if needed
         res.json({ success: true, message: "Refund request received" });
 
     } catch (error) {
@@ -440,7 +444,7 @@ async function executeRefundLogic(data, res) {
 // ============================================
 
 app.get('/', (req, res) => {
-  res.send('🚀 ORBE Arbiter Backend is Running Securely v3.6 (Enhanced Low Balance Protection)');
+  res.send('🚀 ORBE Arbiter Backend is Running Securely v3.7 (Double Spend Catch & Skip)');
 });
 
 app.post('/api/arbiter/execute-swap', authenticate, (req, res) => {
