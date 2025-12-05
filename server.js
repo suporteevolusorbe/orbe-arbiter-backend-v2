@@ -358,6 +358,21 @@ app.post('/api/arbiter/execute-swap', (req, res, next) => {
     processQueue();
 });
 
+// 🛠️ DEBUG: Clear Cache Endpoint (To allow retrying a specific swap)
+app.delete('/api/arbiter/cache/:inviteCode', (req, res, next) => {
+    const auth = req.headers.authorization;
+    if (!auth || auth !== `Bearer ${API_SECRET}`) return res.status(401).json({error: "Unauthorized"});
+    next();
+}, (req, res) => {
+    const { inviteCode } = req.params;
+    if (swapState.has(inviteCode)) {
+        swapState.delete(inviteCode);
+        console.log(`🗑️ Manually cleared cache for ${inviteCode}`);
+        return res.json({ success: true, message: `Cache cleared for ${inviteCode}` });
+    }
+    return res.status(404).json({ success: false, message: "Invite code not found in cache" });
+});
+
 app.listen(PORT, () => {
     console.log(`🚀 Server v4.0 running on port ${PORT}`);
 });
