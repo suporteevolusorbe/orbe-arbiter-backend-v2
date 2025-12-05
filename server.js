@@ -167,6 +167,25 @@ async function executeSwapLogic(data, res) {
         } catch (e) { return -1; } // Error flag
     };
 
+    // 🧹 HELPER: Sanitize Amount (Truncate to decimals to avoid underflow)
+    const sanitizeAmount = (amount, decimals) => {
+        let amountStr = amount.toString();
+
+        // Handle scientific notation if present (very small numbers)
+        if (amountStr.includes('e')) {
+            amountStr = amount.toFixed(decimals);
+        }
+
+        const dotIndex = amountStr.indexOf('.');
+        if (dotIndex !== -1) {
+            const decimalsPart = amountStr.substring(dotIndex + 1);
+            if (decimalsPart.length > decimals) {
+                return amountStr.substring(0, dotIndex + 1 + decimals);
+            }
+        }
+        return amountStr;
+    };
+
     // 📤 HELPER: Transfer
     const transfer = async (tokenAddr, to, amount, label) => {
         if (!amount || parseFloat(amount) <= 0) return "0x_skipped";
@@ -179,7 +198,8 @@ async function executeSwapLogic(data, res) {
             return "0x_skipped_rpc_error";
         }
 
-        if (available < required) {
+        // Using a small tolerance for floating point comparison
+        if (available < required * 0.999999) {
             console.warn(`⏳ Waiting for deposit: ${label}. Need ${required}, Have ${available}`);
             return "0x_waiting_for_deposit"; // Special flag
         }
@@ -197,19 +217,23 @@ async function executeSwapLogic(data, res) {
         try {
             const isNative = WRAPPED_NATIVE_TOKENS[tokenAddr.toLowerCase()] || tokenAddr.length < 10;
             let tx;
-            
+
             if (isNative) {
-                const val = ethers.parseUnits(amount.toString(), 18);
+                const cleanAmount = sanitizeAmount(amount, 18);
+                const val = ethers.parseUnits(cleanAmount, 18);
                 tx = await wallet.sendTransaction({ to, value: val, nonce: currentNonce++ });
             } else {
                 const abi = ["function transfer(address, uint256) returns (bool)", "function decimals() view returns (uint8)"];
                 const contract = new ethers.Contract(tokenAddr, abi, wallet);
                 let dec = 18;
                 try { dec = await contract.decimals(); } catch(e) {}
-                const val = ethers.parseUnits(amount.toString(), dec);
+
+                const cleanAmount = sanitizeAmount(amount, dec);
+                const val = ethers.parseUnits(cleanAmount, dec);
+
                 tx = await contract.transfer(to, val, { nonce: currentNonce++ });
             }
-            
+
             console.log(`   ✅ Tx Hash: ${tx.hash}`);
             await tx.wait(1);
             return tx.hash;
