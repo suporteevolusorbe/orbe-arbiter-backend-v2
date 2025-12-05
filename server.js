@@ -158,23 +158,7 @@ async function executeSwapLogic(data, res) {
       }
     }
 
-    // 🔍 HELPER: Get Balance
-    const getBalance = async (tokenAddr) => {
-        try {
-            const isNative = WRAPPED_NATIVE_TOKENS[tokenAddr.toLowerCase()] || tokenAddr.length < 10;
-            if (isNative) {
-                const bal = await provider.getBalance(wallet.address);
-                return parseFloat(ethers.formatUnits(bal, 18));
-            } else {
-                const abi = ["function balanceOf(address) view returns (uint256)", "function decimals() view returns (uint8)"];
-                const contract = new ethers.Contract(tokenAddr, abi, wallet);
-                const bal = await contract.balanceOf(wallet.address);
-                let decimals = 18;
-                try { decimals = await contract.decimals(); } catch(e) {}
-                return parseFloat(ethers.formatUnits(bal, decimals));
-            }
-        } catch (e) { return -1; } // Error flag
-    };
+
 
     // 🧹 HELPER: Is Native Token
     const isNativeToken = (tokenAddr) => {
