@@ -123,8 +123,17 @@ async function executeSwapLogic(data, res) {
   // Check Cache
   let state = swapState.get(inviteCode);
   if (state && state.completed) {
-    console.log(`✅ Returning cached result for ${inviteCode}`);
-    return res.json({ success: true, message: "Already completed", cached: true });
+      console.log(`✅ Returning cached result for ${inviteCode}`);
+      return res.json({ 
+          success: true, 
+          message: "Already completed", 
+          cached: true,
+          transactions: {
+              buyer: state.buyerTx,
+              seller: state.sellerTx,
+              fees: state.feesTx
+          }
+      });
   }
 
   if (!state) {
