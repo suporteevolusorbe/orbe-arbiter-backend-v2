@@ -148,7 +148,13 @@ async function processQueue() {
   } catch (error) {
     console.error("❌ Queue Error:", error);
     if (!task.res.headersSent) {
-      task.res.status(500).json({ success: false, error: error.message });
+      // 🔥 RETURN 200 even on queue error to prevent infinite retries
+      task.res.json({ 
+        success: false, 
+        error: error.message,
+        message: "Queue processing failed (stopped retry)",
+        code: "QUEUE_ERROR"
+      });
     }
   } finally {
     isProcessing = false;
@@ -315,13 +321,10 @@ async function executeSwapLogic(data, res) {
         console.error(`   ❌ Failed to transfer to ${label}:`, err.message);
         
         // 🛡️ ROBUST ERROR CHECKING (Ethers v6)
-        // Ethers v6 wraps reverts in CALL_EXCEPTION with details in 'reason' or 'shortMessage'
         const msg = (err.message || "").toLowerCase();
         const reason = (err.reason || "").toLowerCase();
         const shortMsg = (err.shortMessage || "").toLowerCase();
         const code = (err.code || "");
-        
-        // Also check error.info.error.message (common in some RPC providers/Ethers v6)
         const infoMsg = (err.info?.error?.message || "").toLowerCase();
         
         // Check for "exceeds balance" or "insufficient funds" in ANY error property
@@ -335,20 +338,16 @@ async function executeSwapLogic(data, res) {
             infoMsg.includes("exceeds balance") ||
             infoMsg.includes("insufficient funds") ||
             code === 'INSUFFICIENT_FUNDS' ||
-            (code === 'CALL_EXCEPTION'); // 🔥 AGGRESSIVE FIX: Treat ANY Call Exception during transfer as potential balance issue if we can't parse it, or at least handle it gracefully instead of crashing the outer loop.
-            
-        // Actually, being too aggressive might skip legit errors. 
-        // But given the "CALL_EXCEPTION" with "estimateGas" failure usually means revert, and revert on transfer usually means balance or allowance.
-        // Since this is the Arbiter wallet sending (no allowance needed for native, or we assume tokens are there), it's almost always balance.
-        
-        if (isLowBalance || code === 'CALL_EXCEPTION') {
-             console.warn(`⚠️ DETECTED TRANSACTION FAILURE (Likely Low Balance/Double Spend). SKIPPING ${label} TO UNBLOCK QUEUE.`);
-             // Try to reset nonce just in case
+            (code === 'CALL_EXCEPTION'); // Treat call exception as potential balance issue on transfer
+
+        if (isLowBalance) {
+             console.warn(`⚠️ DETECTED FAILURE (Likely Low Balance/Double Spend). SKIPPING ${label} TO UNBLOCK QUEUE.`);
              try { currentNonce = await provider.getTransactionCount(wallet.address, "latest"); } catch(e) {}
              return "0x_skipped_low_balance_error";
         }
         
         try { currentNonce = await provider.getTransactionCount(wallet.address, "latest"); } catch(e) {}
+        // IMPORTANT: Return string, do NOT throw
         return `0x_error_${code || 'failed'}`; 
       }
     };
@@ -375,9 +374,8 @@ async function executeSwapLogic(data, res) {
     // 1. Transfer to Buyer
     if (!state.buyerTx || state.buyerTx.startsWith('0x_error')) {
         const result = await transferToken(sellerToken, buyerAddress, buyerNet, "Buyer");
-        // If we skipped due to low balance/error, mark as "done" to stop loop
-        if (result === "0x_skipped_low_balance" || result === "0x_skipped_low_balance_error") {
-            state.buyerTx = "0x_already_done"; 
+        if (result && result.startsWith("0x_skipped")) {
+            state.buyerTx = "0x_already_done_or_skipped"; 
         } else {
             state.buyerTx = result;
         }
@@ -387,8 +385,8 @@ async function executeSwapLogic(data, res) {
     // 2. Transfer to Seller
     if (!state.sellerTx || state.sellerTx.startsWith('0x_error')) {
         const result = await transferToken(buyerToken, sellerAddress, sellerNet, "Seller");
-         if (result === "0x_skipped_low_balance" || result === "0x_skipped_low_balance_error") {
-            state.sellerTx = "0x_already_done";
+        if (result && result.startsWith("0x_skipped")) {
+            state.sellerTx = "0x_already_done_or_skipped";
         } else {
             state.sellerTx = result;
         }
@@ -433,7 +431,13 @@ async function executeSwapLogic(data, res) {
 
   } catch (error) {
     console.error("❌ Swap Logic Error:", error);
-    res.status(500).json({ success: false, error: error.message });
+    // 🔥 CRITICAL FIX: Return 200 instead of 500 to stop Auto-Retry loops
+    res.json({ 
+        success: false, 
+        error: error.message,
+        message: "Swap failed (stopped retry loop)",
+        code: "SWAP_ERROR_STOP_RETRY"
+    });
   }
 }
 
@@ -458,7 +462,7 @@ async function executeRefundLogic(data, res) {
         res.json({ success: true, message: "Refund request received" });
 
     } catch (error) {
-         res.status(500).json({ success: false, error: error.message });
+         res.status(200).json({ success: false, error: error.message });
     }
 }
 
@@ -467,7 +471,7 @@ async function executeRefundLogic(data, res) {
 // ============================================
 
 app.get('/', (req, res) => {
-  res.send('🚀 ORBE Arbiter Backend is Running Securely v3.7 (Double Spend Catch & Skip)');
+  res.send('🚀 ORBE Arbiter Backend is Running Securely v3.9 (Double Spend Catch & STOP Retry)');
 });
 
 app.post('/api/arbiter/execute-swap', authenticate, (req, res) => {
