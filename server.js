@@ -269,26 +269,51 @@ async function executeSwapLogic(data, res) {
 
     // --- EXECUTION FLOW ---
 
-    // 1. Fee Config
+    // 0. Helper to get decimals
+    const getDecimals = async (tokenAddr) => {
+        if (isNativeToken(tokenAddr)) return 18;
+        try {
+            const abi = ["function decimals() view returns (uint8)"];
+            const contract = new ethers.Contract(tokenAddr, abi, wallet);
+            return Number(await contract.decimals());
+        } catch (e) { return 18; }
+    };
+
+    // 1. Calculate Amounts (BigInt Precision)
+    // Avoid parseFloat for amounts to prevent precision loss and scientific notation errors
+    const sellerDecimals = await getDecimals(sellerToken);
+    const buyerDecimals = await getDecimals(buyerToken);
+
     const feeTotal = parseFloat(feePercent) || 10.0;
-    const feePart = feeTotal / 2 / 100;
+    // feePart = feeTotal / 2. Example: 10% -> 5% per party.
+    // We use Basis Points (bps) where 10000 = 100%. 5% = 500 bps.
+    const feeBps = BigInt(Math.round((feeTotal / 2) * 100));
+
+    // Parse inputs safely to Wei (BigInt)
+    const sellerAmountWei = ethers.parseUnits(sanitizeAmount(sellerAmount, sellerDecimals), sellerDecimals);
+    const buyerAmountWei = ethers.parseUnits(sanitizeAmount(buyerAmount, buyerDecimals), buyerDecimals);
+
+    // Calculate Net Amounts (Wei)
+    const buyerFeeWei = (sellerAmountWei * feeBps) / 10000n;
+    const buyerNetWei = sellerAmountWei - buyerFeeWei;
     
-    const buyerFee = parseFloat(sellerAmount) * feePart;
-    const buyerNet = parseFloat(sellerAmount) - buyerFee;
-    
-    const sellerFee = parseFloat(buyerAmount) * feePart;
-    const sellerNet = parseFloat(buyerAmount) - sellerFee;
+    const sellerFeeWei = (buyerAmountWei * feeBps) / 10000n;
+    const sellerNetWei = buyerAmountWei - sellerFeeWei;
+
+    // Format back to safe strings (avoids scientific notation)
+    const buyerNetStr = ethers.formatUnits(buyerNetWei, sellerDecimals);
+    const sellerNetStr = ethers.formatUnits(sellerNetWei, buyerDecimals);
 
     let status = "processing";
 
     // 2. Transfer to Buyer
     if (!state.buyerTx || state.buyerTx.startsWith("0x_waiting")) {
-        state.buyerTx = await transfer(sellerToken, buyerAddress, buyerNet, "Buyer");
+        state.buyerTx = await transfer(sellerToken, buyerAddress, buyerNetStr, "Buyer");
     }
 
     // 3. Transfer to Seller
     if (!state.sellerTx || state.sellerTx.startsWith("0x_waiting")) {
-        state.sellerTx = await transfer(buyerToken, sellerAddress, sellerNet, "Seller");
+        state.sellerTx = await transfer(buyerToken, sellerAddress, sellerNetStr, "Seller");
     }
 
     // 4. Fees (Only if main transfers succeeded or skipped)
