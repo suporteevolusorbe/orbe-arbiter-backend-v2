@@ -176,71 +176,99 @@ async function executeSwapLogic(data, res) {
         } catch (e) { return -1; } // Error flag
     };
 
-    // 🧹 HELPER: Sanitize Amount (Truncate to decimals to avoid underflow)
-    const sanitizeAmount = (amount, decimals) => {
-        let amountStr = amount.toString();
+    // 🧹 HELPER: Is Native Token
+    const isNativeToken = (tokenAddr) => {
+        if (!tokenAddr) return false;
+        const lower = tokenAddr.toLowerCase();
+        return lower === 'native' || lower.length < 10 || WRAPPED_NATIVE_TOKENS[lower];
+    };
 
-        // Handle scientific notation if present (very small numbers)
-        if (amountStr.includes('e')) {
-            amountStr = amount.toFixed(decimals);
+    // 🧹 HELPER: Sanitize Amount (Safe String Handling)
+    const sanitizeAmount = (amount, decimals) => {
+        let amountStr = String(amount);
+
+        // Handle scientific notation
+        if (amountStr.toLowerCase().includes('e')) {
+            amountStr = Number(amount).toFixed(decimals);
         }
 
         const dotIndex = amountStr.indexOf('.');
         if (dotIndex !== -1) {
             const decimalsPart = amountStr.substring(dotIndex + 1);
             if (decimalsPart.length > decimals) {
-                return amountStr.substring(0, dotIndex + 1 + decimals);
+                amountStr = amountStr.substring(0, dotIndex + 1 + decimals);
             }
         }
         return amountStr;
     };
 
-    // 📤 HELPER: Transfer
+    // 🔍 HELPER: Get Balance (Safe Strings)
+    const getBalance = async (tokenAddr) => {
+        try {
+            if (isNativeToken(tokenAddr)) {
+                const bal = await provider.getBalance(wallet.address);
+                return ethers.formatUnits(bal, 18); // Return string
+            } else {
+                const abi = ["function balanceOf(address) view returns (uint256)", "function decimals() view returns (uint8)"];
+                const contract = new ethers.Contract(tokenAddr, abi, wallet);
+                const bal = await contract.balanceOf(wallet.address);
+                let decimals = 18;
+                try { decimals = await contract.decimals(); } catch(e) {}
+                return ethers.formatUnits(bal, decimals); // Return string
+            }
+        } catch (e) { 
+            console.error("GetBalance Error:", e.message);
+            return "-1"; 
+        }
+    };
+
+    // 📤 HELPER: Transfer (Safe BigInt Math)
     const transfer = async (tokenAddr, to, amount, label) => {
-        if (!amount || parseFloat(amount) <= 0) return "0x_skipped";
+        const amountStr = String(amount);
+        if (!amountStr || parseFloat(amountStr) <= 0) return "0x_skipped";
 
-        const required = parseFloat(amount);
-        const available = await getBalance(tokenAddr);
-
-        if (available === -1) {
-            console.warn(`⚠️ Could not fetch balance for ${label}. RPC issue?`);
-            return "0x_skipped_rpc_error";
-        }
-
-        // Using a small tolerance for floating point comparison
-        if (available < required * 0.999999) {
-            console.warn(`⏳ Waiting for deposit: ${label}. Need ${required}, Have ${available}`);
-            return "0x_waiting_for_deposit"; // Special flag
-        }
-
-        // Check Gas (Native Balance)
+        // 1. Check Gas (Native Balance) first
         const nativeBal = await provider.getBalance(wallet.address);
-        const nativeBalEth = parseFloat(ethers.formatEther(nativeBal));
-        if (nativeBalEth < 0.002) {
+        if (nativeBal < ethers.parseEther("0.002")) {
             console.error("❌ ARBITER OUT OF GAS!");
             return "0x_error_out_of_gas";
         }
 
-        console.log(`📤 Sending ${amount} to ${label}...`);
+        // 2. Resolve decimals
+        let decimals = 18;
+        if (!isNativeToken(tokenAddr)) {
+             try {
+                 const abi = ["function decimals() view returns (uint8)"];
+                 const contract = new ethers.Contract(tokenAddr, abi, wallet);
+                 decimals = await contract.decimals();
+             } catch (e) {}
+        }
+
+        // 3. Sanitize & Convert to Wei (BigInt)
+        const cleanAmount = sanitizeAmount(amountStr, Number(decimals));
+        const requiredWei = ethers.parseUnits(cleanAmount, decimals);
+
+        // 4. Check Token Balance
+        const availableStr = await getBalance(tokenAddr);
+        if (availableStr === "-1") return "0x_skipped_rpc_error";
+
+        const availableWei = ethers.parseUnits(availableStr, decimals);
+
+        if (availableWei < requiredWei) {
+            console.warn(`⏳ Waiting for deposit: ${label}. Need ${cleanAmount}, Have ${availableStr}`);
+            return "0x_waiting_for_deposit";
+        }
+
+        console.log(`📤 Sending ${cleanAmount} to ${label}...`);
 
         try {
-            const isNative = WRAPPED_NATIVE_TOKENS[tokenAddr.toLowerCase()] || tokenAddr.length < 10;
             let tx;
-
-            if (isNative) {
-                const cleanAmount = sanitizeAmount(amount, 18);
-                const val = ethers.parseUnits(cleanAmount, 18);
-                tx = await wallet.sendTransaction({ to, value: val, nonce: currentNonce++ });
+            if (isNativeToken(tokenAddr)) {
+                tx = await wallet.sendTransaction({ to, value: requiredWei, nonce: currentNonce++ });
             } else {
-                const abi = ["function transfer(address, uint256) returns (bool)", "function decimals() view returns (uint8)"];
+                const abi = ["function transfer(address, uint256) returns (bool)"];
                 const contract = new ethers.Contract(tokenAddr, abi, wallet);
-                let dec = 18;
-                try { dec = await contract.decimals(); } catch(e) {}
-
-                const cleanAmount = sanitizeAmount(amount, dec);
-                const val = ethers.parseUnits(cleanAmount, dec);
-
-                tx = await contract.transfer(to, val, { nonce: currentNonce++ });
+                tx = await contract.transfer(to, requiredWei, { nonce: currentNonce++ });
             }
 
             console.log(`   ✅ Tx Hash: ${tx.hash}`);
