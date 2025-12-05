@@ -164,16 +164,16 @@ async function executeSwapLogic(data, res) {
     const isNativeToken = (tokenAddr) => {
         if (!tokenAddr) return false;
         const lower = tokenAddr.toLowerCase();
-        return lower === 'native' || lower.length < 10 || WRAPPED_NATIVE_TOKENS[lower];
+        return lower === 'native' || WRAPPED_NATIVE_TOKENS[lower] === true;
     };
 
     // 🧹 HELPER: Sanitize Amount (Safe String Handling)
     const sanitizeAmount = (amount, decimals) => {
         let amountStr = String(amount);
 
-        // Handle scientific notation
+        // Reject scientific notation to avoid precision loss
         if (amountStr.toLowerCase().includes('e')) {
-            amountStr = Number(amount).toFixed(decimals);
+            throw new Error("Amount in scientific notation is not supported");
         }
 
         const dotIndex = amountStr.indexOf('.');
