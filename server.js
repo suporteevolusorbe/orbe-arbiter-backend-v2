@@ -171,11 +171,20 @@ async function executeSwapLogic(data, res) {
     const sanitizeAmount = (amount, decimals) => {
         let amountStr = String(amount);
 
-        // Reject scientific notation to avoid precision loss
+        // Handle scientific notation (e.g. 1e-7)
         if (amountStr.toLowerCase().includes('e')) {
-            throw new Error("Amount in scientific notation is not supported");
+             // Convert to decimal string using toFixed safely
+             // We use 'decimals' to ensure we don't return excessive precision
+             // but we need to be careful not to round down to 0 for very small numbers if decimals < needed
+             // However, we usually pass the token's decimals here (e.g. 18), so it should be fine.
+             try {
+                 amountStr = Number(amount).toFixed(decimals);
+             } catch (e) {
+                 throw new Error(`Invalid amount format: ${amount}`);
+             }
         }
 
+        // Truncate extra decimals
         const dotIndex = amountStr.indexOf('.');
         if (dotIndex !== -1) {
             const decimalsPart = amountStr.substring(dotIndex + 1);
@@ -323,9 +332,22 @@ async function executeSwapLogic(data, res) {
         (state.sellerTx && !state.sellerTx.startsWith("0x_waiting"));
 
     if (mainTxFinished && !state.feesTx) {
-        // Simple fee transfer (just one for now to save gas/complexity)
-        // In production, you might want to batch these
-        state.feesTx = "0x_fees_pending_batch"; 
+        console.log(`💰 Collecting Fees for Treasury: ${TREASURY_ADDRESS}`);
+        
+        // Calculate Fee Strings for Transfer
+        const buyerFeeStr = ethers.formatUnits(buyerFeeWei, sellerDecimals);
+        const sellerFeeStr = ethers.formatUnits(sellerFeeWei, buyerDecimals);
+
+        // Transfer fee from Seller Token (taken from seller amount) -> Treasury
+        // Note: This is fee collected from the Seller's token (e.g. USDT)
+        const fee1Tx = await transfer(sellerToken, TREASURY_ADDRESS, buyerFeeStr, "Treasury (Fee 1)");
+        
+        // Transfer fee from Buyer Token (taken from buyer amount) -> Treasury
+        // Note: This is fee collected from the Buyer's token (e.g. WBNB)
+        const fee2Tx = await transfer(buyerToken, TREASURY_ADDRESS, sellerFeeStr, "Treasury (Fee 2)");
+        
+        state.feesTx = `${fee1Tx}|${fee2Tx}`;
+        console.log(`   ✅ Fees Sent: ${state.feesTx}`);
     }
 
     swapState.set(inviteCode, state);
